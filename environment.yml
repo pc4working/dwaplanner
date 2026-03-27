@@ -1,0 +1,9 @@
+name: dwaplanner
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pip
+  - pip:
+      - open3d==0.19.0
