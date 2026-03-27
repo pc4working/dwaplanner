@@ -1,15 +1,16 @@
 # dwaplanner
 
-基于 `voxsense` 2.5D 可通行栅格的最小 DWA 本地规划器实现。项目包含：
+基于 `voxsense` 可通行栅格的最小 DWA 本地规划器实现。主流程会复用 `voxsense` 的点云建图，再把结果直接叠加到二维 BEV 图片上。项目包含：
 
 - `dwaplanner/dwa_planner.py`: DWA 核心采样、轨迹仿真、方向可通行检查和评分。
-- `dwaplanner/dwa_visualizer.py`: 基于 Open3D 的轨迹、速度指令、目标点可视化。
-- `test_dwa_planner.py`: 读取点云构建 `voxsense` 栅格并运行一次规划的演示脚本。
-- `tests/test_dwa_planner.py`: 不依赖点云文件的最小单元测试。
+- `dwaplanner/dwa_visualizer.py`: 把候选轨迹、最佳轨迹、起点、目标和速度箭头叠加到二维图片上。
+- `dwaplanner/voxsense_adapter.py`: 导入相邻 `voxsense` 仓库里的建图和 BEV 渲染函数。
+- `test_dwa_planner.py`: 读取点云、运行规划并输出带叠加轨迹的 BEV PNG。
+- `tests/test_dwa_planner.py`: 基于二维栅格图的最小单元测试。
 
 ## 依赖
 
-推荐直接复用上游 `voxsense` 环境：
+可以直接复用已有 conda 环境：
 
 ```bash
 source ~/anaconda3/bin/activate
@@ -26,22 +27,28 @@ conda activate /home/pc/code/dwaplanner/.conda-env
 
 ## 运行演示
 
-默认会尝试从相邻仓库 `/home/pc/code/voxsense` 导入构图和可视化模块。
+默认会读取相邻 `voxsense` 仓库里的点云文件并生成 BEV 底图。
 
 ```bash
 python test_dwa_planner.py /home/pc/code/voxsense/pcd/平地无障碍.pcd --goal-x 0.0 --goal-y 2.0
 ```
 
-不打开 Open3D 窗口，只打印规划结果：
+绕障示例：
 
 ```bash
-python test_dwa_planner.py /home/pc/code/voxsense/pcd/柱子.pcd --goal-y 2.5 --show-blocked-directions --no-vis
+python test_dwa_planner.py /home/pc/code/voxsense/pcd/柱子.pcd --goal-y 2.5
 ```
 
-如果 `voxsense` 仓库不在同级目录，可显式指定：
+脚本会先调用 `voxsense` 的 traversability 构图，再生成二维 BEV 图，并把 DWA 结果直接叠加到同一张 PNG 上，输出到 `outputs/`。
+
+主要参数：
 
 ```bash
-export VOXSENSE_REPO=/path/to/voxsense
+python test_dwa_planner.py /home/pc/code/voxsense/pcd/平地无障碍.pcd \
+  --voxel-size 0.15 \
+  --pixels-per-meter 120 \
+  --goal-y 2.0 \
+  --output-path outputs/flat_dwa_bev.png
 ```
 
 ## 算法说明
@@ -58,14 +65,17 @@ export VOXSENSE_REPO=/path/to/voxsense
 ```text
 score =
   heading_weight * heading_alignment +
+  goal_progress_weight * goal_progress +
   clearance_weight * obstacle_clearance +
   velocity_weight * speed_preference
 ```
 
-其中碰撞检查同时使用两类信息：
+其中碰撞检查使用两类信息：
 
 - 栅格占据状态：轨迹必须始终位于非 `EMPTY` 的 cell 内。
 - 方向可通行掩码：跨 cell 移动时必须满足 `passable_mask[row, col, direction] = True`。
+
+`goal_progress` 表示一条候选轨迹在预测时域内让机器人离目标减少了多少距离。这个项的作用是避免机器人只是在原地保持朝向正确，却没有真正向目标推进。
 
 ## 测试
 

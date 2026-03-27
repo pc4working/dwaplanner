@@ -49,6 +49,12 @@ def single_frame_module() -> ModuleType:
     return importlib.import_module("test_single_frame_voxel_vis")
 
 
+@lru_cache(maxsize=1)
+def bev_module() -> ModuleType:
+    _ensure_voxsense_on_path()
+    return importlib.import_module("test_directional_traversability_bev")
+
+
 def build_traversability_run(*args: Any, **kwargs: Any) -> Any:
     if args and isinstance(args[0], str):
         args = (Path(args[0]).expanduser(), *args[1:])
@@ -71,6 +77,14 @@ def build_render_point_cloud(*args: Any, **kwargs: Any) -> Any:
 
 def print_run_stats(*args: Any, **kwargs: Any) -> Any:
     return directional_module().print_run_stats(*args, **kwargs)
+
+
+def build_bev_image(*args: Any, **kwargs: Any) -> Any:
+    return bev_module().build_bev_image(*args, **kwargs)
+
+
+def bev_world_to_pixel(*args: Any, **kwargs: Any) -> Any:
+    return bev_module().world_to_pixel(*args, **kwargs)
 
 
 def resolve_input_path(*args: Any, **kwargs: Any) -> Any:

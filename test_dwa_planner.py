@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Demo script for running DWA on a voxsense traversability grid."""
+"""Demo script for running DWA on a voxsense traversability BEV image."""
 
 from __future__ import annotations
 
@@ -8,25 +8,30 @@ import math
 from pathlib import Path
 
 from dwaplanner.dwa_planner import DWAConfig, DWAPlanner, RobotState
-from dwaplanner.dwa_visualizer import visualize_dwa_result
-from dwaplanner.voxsense_adapter import build_traversability_run, print_run_stats
+from dwaplanner.dwa_visualizer import render_dwa_on_base_image
+from dwaplanner.voxsense_adapter import (
+    bev_world_to_pixel,
+    build_bev_image,
+    build_traversability_run,
+    print_run_stats,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run DWA local planning on a voxsense traversability grid.",
+        description="Run DWA local planning on a voxsense BEV image.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "input_path",
         nargs="?",
         type=Path,
-        help="Path to a single-frame point cloud. Defaults to the first file under the sibling voxsense/pcd directory.",
+        help="Path to a point cloud file. Defaults to the first file under the sibling voxsense/pcd directory.",
     )
     parser.add_argument("--goal-x", type=float, default=0.0, help="Goal x position in meters.")
     parser.add_argument("--goal-y", type=float, default=2.0, help="Goal y position in meters.")
     parser.add_argument("--start-x", type=float, default=0.0, help="Robot start x position.")
-    parser.add_argument("--start-y", type=float, default=0.0, help="Robot start y position.")
+    parser.add_argument("--start-y", type=float, default=None, help="Robot start y position. Defaults to half a cell.")
     parser.add_argument(
         "--start-theta-deg",
         type=float,
@@ -60,19 +65,28 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="A direction is blocked when the neighbor height delta exceeds this threshold in z voxels.",
     )
-    parser.add_argument("--show-points", action="store_true", help="Render the filtered point cloud.")
+    parser.add_argument("--show-points", action="store_true", help="Render the filtered point cloud on the BEV base image.")
     parser.add_argument(
         "--show-blocked-directions",
         action="store_true",
-        help="Show red blocked spokes in the grid visualization.",
+        help="Render red spokes for blocked directions in addition to passable spokes.",
     )
+    parser.add_argument("--max-render-points", type=int, default=20000, help="Maximum number of rendered context points.")
+    parser.add_argument("--x-limit", type=float, default=4.0, help="Render horizontal range [-x-limit, x-limit] in meters.")
+    parser.add_argument("--forward-limit", type=float, default=8.0, help="Render forward range [0, forward-limit] in meters.")
+    parser.add_argument("--pixels-per-meter", type=float, default=120.0, help="Resolution of the output image.")
+    parser.add_argument("--cell-fill-ratio", type=float, default=0.88, help="Fraction of each voxel cell used for the filled tile.")
+    parser.add_argument("--point-radius-px", type=int, default=2, help="Radius for rendered context points.")
+    parser.add_argument("--line-width-px", type=int, default=2, help="Line width for BEV direction spokes.")
+    parser.add_argument("--margin-px", type=int, default=32, help="Outer image margin in pixels.")
     parser.add_argument(
-        "--max-render-points",
-        type=int,
-        default=20000,
-        help="Maximum number of point cloud points rendered when --show-points is enabled.",
+        "--output-path",
+        type=Path,
+        default=None,
+        help="Output image path. Defaults to outputs/<input_stem>_dwa_bev.png.",
     )
-    parser.add_argument("--no-vis", action="store_true", help="Run planning without opening the Open3D window.")
+    parser.add_argument("--overlay-scale-px", type=int, default=10, help="Reference pixel size for DWA overlay thickness.")
+    parser.add_argument("--draw-invalid", action="store_true", help="Also draw invalid candidate trajectories.")
     parser.add_argument("--max-linear-velocity", type=float, default=1.0, help="Max linear velocity.")
     parser.add_argument("--max-angular-velocity", type=float, default=1.0, help="Max angular velocity.")
     parser.add_argument("--max-linear-acceleration", type=float, default=0.5, help="Max linear acceleration.")
@@ -83,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--linear-samples", type=int, default=7, help="Number of sampled linear velocities.")
     parser.add_argument("--angular-samples", type=int, default=11, help="Number of sampled angular velocities.")
     parser.add_argument("--heading-weight", type=float, default=1.0, help="Weight for heading alignment.")
+    parser.add_argument("--goal-progress-weight", type=float, default=0.8, help="Weight for distance reduction toward the goal.")
     parser.add_argument("--clearance-weight", type=float, default=0.5, help="Weight for clearance.")
     parser.add_argument("--velocity-weight", type=float, default=0.2, help="Weight for speed preference.")
     parser.add_argument(
@@ -106,6 +121,7 @@ def build_config(args: argparse.Namespace) -> DWAConfig:
         linear_velocity_samples=args.linear_samples,
         angular_velocity_samples=args.angular_samples,
         heading_weight=args.heading_weight,
+        goal_progress_weight=args.goal_progress_weight,
         clearance_weight=args.clearance_weight,
         velocity_weight=args.velocity_weight,
         clearance_search_radius_cells=args.clearance_search_radius_cells,
@@ -140,7 +156,7 @@ def main() -> None:
 
     state = RobotState(
         x=args.start_x,
-        y=args.start_y,
+        y=args.start_y if args.start_y is not None else run.grid.voxel_size * 0.5,
         theta=math.radians(args.start_theta_deg),
         linear_velocity=args.current_v,
         angular_velocity=args.current_w,
@@ -150,19 +166,31 @@ def main() -> None:
     result = planner.plan(run.grid, goal_xy=goal_xy, state=state)
     print_plan_summary(result)
 
-    if args.no_vis:
-        return
-
-    context_points = run.forward_points if args.show_points else None
-    visualize_dwa_result(
-        grid=run.grid,
+    base_image_rgb = build_bev_image(run, args)
+    if args.output_path is not None:
+        output_path = args.output_path.expanduser().resolve()
+    else:
+        input_name = run.input_path.stem
+        output_path = (Path.cwd() / "outputs" / f"{input_name}_dwa_bev.png").resolve()
+    image = render_dwa_on_base_image(
+        base_image_rgb=base_image_rgb,
         result=result,
         goal_xy=goal_xy,
         state=state,
-        show_blocked_directions=args.show_blocked_directions,
-        context_points=context_points,
-        max_render_points=args.max_render_points,
+        project_xy=lambda point_xy: bev_world_to_pixel(
+            x=float(point_xy[0]),
+            y=float(point_xy[1]),
+            x_limit=args.x_limit,
+            forward_limit=args.forward_limit,
+            pixels_per_meter=args.pixels_per_meter,
+            margin_px=args.margin_px,
+        ),
+        scale_px=args.overlay_scale_px,
+        draw_invalid=args.draw_invalid,
     )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+    print(f"output_image: {output_path}")
 
 
 if __name__ == "__main__":

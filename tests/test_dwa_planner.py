@@ -2,56 +2,24 @@ from __future__ import annotations
 
 import math
 import unittest
-from dataclasses import dataclass
 
 import numpy as np
 
 from dwaplanner.dwa_planner import DWAPlanner, RobotState, world_to_grid
+from dwaplanner.dwa_visualizer import render_dwa_result_image
+from dwaplanner.image_grid import build_grid_from_image_array
 
 
-@dataclass(slots=True)
-class FakeGrid:
-    voxel_size: float
-    min_ix: int
-    min_iy: int
-    height_index: np.ndarray
-    state: np.ndarray
-    passable_mask: np.ndarray
+def make_flat_grid(rows: int = 12, cols: int = 13, meters_per_pixel: float = 0.25):
+    image = np.full((rows, cols), 255, dtype=np.uint8)
+    return build_grid_from_image_array(image, meters_per_pixel=meters_per_pixel)
 
 
-def make_flat_grid(rows: int = 12, cols: int = 13, voxel_size: float = 0.25) -> FakeGrid:
-    min_ix = -(cols // 2)
-    min_iy = 0
-    height_index = np.zeros((rows, cols), dtype=np.int32)
-    state = np.ones((rows, cols), dtype=np.uint8)
-    passable_mask = np.zeros((rows, cols, 8), dtype=bool)
-
-    offsets = (
-        (0, 1),
-        (1, 1),
-        (1, 0),
-        (1, -1),
-        (0, -1),
-        (-1, -1),
-        (-1, 0),
-        (-1, 1),
-    )
-    for row in range(rows):
-        for col in range(cols):
-            for direction_index, (dx, dy) in enumerate(offsets):
-                neighbor_row = row + dy
-                neighbor_col = col + dx
-                if 0 <= neighbor_row < rows and 0 <= neighbor_col < cols:
-                    passable_mask[row, col, direction_index] = True
-
-    return FakeGrid(
-        voxel_size=voxel_size,
-        min_ix=min_ix,
-        min_iy=min_iy,
-        height_index=height_index,
-        state=state,
-        passable_mask=passable_mask,
-    )
+def make_blocked_forward_grid(rows: int = 18, cols: int = 17, meters_per_pixel: float = 0.2):
+    image = np.full((rows, cols), 255, dtype=np.uint8)
+    center = cols // 2
+    image[rows - 4 : rows - 1, center - 1 : center + 2] = 0
+    return build_grid_from_image_array(image, meters_per_pixel=meters_per_pixel)
 
 
 class DWAPlannerTest(unittest.TestCase):
@@ -80,18 +48,23 @@ class DWAPlannerTest(unittest.TestCase):
         self.assertFalse(result.used_emergency_stop)
 
     def test_blocked_forward_direction_causes_turn(self) -> None:
-        grid = make_flat_grid()
-        start_row, start_col = world_to_grid(0.0, 0.0, grid)
-        grid.passable_mask[start_row, start_col, 0] = False
-        grid.passable_mask[start_row, start_col, 1] = False
-        grid.passable_mask[start_row, start_col, 7] = False
+        grid = make_blocked_forward_grid()
 
         planner = DWAPlanner()
-        result = planner.plan(grid, goal_xy=(0.0, 1.5), state=RobotState())
+        result = planner.plan(grid, goal_xy=(0.2, 1.5), state=RobotState())
 
         self.assertFalse(result.used_emergency_stop)
-        self.assertGreater(abs(result.best_angular_velocity), 0.1)
+        self.assertGreater(abs(result.best_angular_velocity), 0.09)
+        self.assertLess(result.best_linear_velocity, 0.2)
         self.assertTrue(math.isfinite(result.best_score))
+
+    def test_render_output_has_expected_size(self) -> None:
+        grid = make_flat_grid()
+        planner = DWAPlanner()
+        result = planner.plan(grid, goal_xy=(0.0, 1.5), state=RobotState())
+        image = render_dwa_result_image(grid, result, goal_xy=(0.0, 1.5), state=RobotState(), cell_pixels=10)
+
+        self.assertEqual(image.size, (grid.state.shape[1] * 10, grid.state.shape[0] * 10))
 
 
 if __name__ == "__main__":

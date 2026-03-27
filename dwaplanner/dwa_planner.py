@@ -52,6 +52,7 @@ class DWAConfig:
     linear_velocity_samples: int = 7
     angular_velocity_samples: int = 11
     heading_weight: float = 1.0
+    goal_progress_weight: float = 0.8
     clearance_weight: float = 0.5
     velocity_weight: float = 0.2
     clearance_search_radius_cells: int = 4
@@ -89,6 +90,7 @@ class TrajectoryCandidate:
     trajectory: np.ndarray
     score: float
     heading_score: float
+    goal_progress_score: float
     clearance_score: float
     velocity_score: float
     min_clearance: float
@@ -153,6 +155,7 @@ class DWAPlanner:
 
         self._ensure_pose_on_grid(state.x, state.y, grid)
         current_position = np.asarray([state.x, state.y], dtype=np.float64)
+        initial_goal_distance = float(np.linalg.norm(goal - current_position))
         if float(np.linalg.norm(goal - current_position)) <= self.config.goal_tolerance:
             stop_trajectory = self._simulate_trajectory(state, 0.0, 0.0)
             return DWAResult(
@@ -168,6 +171,7 @@ class DWAPlanner:
                         trajectory=stop_trajectory,
                         score=1.0,
                         heading_score=1.0,
+                        goal_progress_score=0.0,
                         clearance_score=1.0,
                         velocity_score=0.0,
                         min_clearance=self._compute_cell_clearance(
@@ -190,15 +194,22 @@ class DWAPlanner:
             final_goal_distance = float(np.linalg.norm(goal - trajectory[-1, :2]))
             if valid:
                 heading_score = self._compute_heading_score(trajectory, goal)
+                goal_progress_score = self._compute_goal_progress_score(
+                    initial_goal_distance=initial_goal_distance,
+                    final_goal_distance=final_goal_distance,
+                    voxel_size=grid.voxel_size,
+                )
                 clearance_score = self._normalize_clearance(min_clearance, grid.voxel_size)
                 velocity_score = self._compute_velocity_score(linear_velocity)
                 score = (
                     self.config.heading_weight * heading_score
+                    + self.config.goal_progress_weight * goal_progress_score
                     + self.config.clearance_weight * clearance_score
                     + self.config.velocity_weight * velocity_score
                 )
             else:
                 heading_score = 0.0
+                goal_progress_score = 0.0
                 clearance_score = 0.0
                 velocity_score = 0.0
                 score = float("-inf")
@@ -209,6 +220,7 @@ class DWAPlanner:
                 trajectory=trajectory,
                 score=score,
                 heading_score=heading_score,
+                goal_progress_score=goal_progress_score,
                 clearance_score=clearance_score,
                 velocity_score=velocity_score,
                 min_clearance=min_clearance,
@@ -383,6 +395,18 @@ class DWAPlanner:
         if max_clearance <= 0.0:
             return 0.0
         return float(np.clip(clearance / max_clearance, 0.0, 1.0))
+
+    def _compute_goal_progress_score(
+        self,
+        initial_goal_distance: float,
+        final_goal_distance: float,
+        voxel_size: float,
+    ) -> float:
+        normalizer = max(initial_goal_distance, voxel_size)
+        if normalizer <= 0.0:
+            return 0.0
+        progress = max(0.0, initial_goal_distance - final_goal_distance)
+        return float(np.clip(progress / normalizer, 0.0, 1.0))
 
     def _compute_velocity_score(self, linear_velocity: float) -> float:
         if self.config.max_linear_velocity <= 0.0:

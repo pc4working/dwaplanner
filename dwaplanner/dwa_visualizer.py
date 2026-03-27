@@ -1,19 +1,15 @@
-"""Open3D helpers for DWA planner visualization."""
+"""2D image visualization helpers for the DWA planner."""
 
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from pathlib import Path
+from typing import Callable
 
 import numpy as np
-import open3d as o3d
+from PIL import Image, ImageDraw
 
-from .dwa_planner import DWAResult, RobotState, grid_cell_height, is_traversable_cell, world_to_grid
-from .voxsense_adapter import (
-    build_direction_lines,
-    build_grid_mesh,
-    build_render_point_cloud,
-)
+from .dwa_planner import DWAResult, RobotState
 
 
 def _trajectory_score_bounds(result: DWAResult) -> tuple[float, float]:
@@ -23,168 +19,175 @@ def _trajectory_score_bounds(result: DWAResult) -> tuple[float, float]:
     return min(valid_scores), max(valid_scores)
 
 
-def _score_to_color(score: float, min_score: float, max_score: float) -> list[float]:
+def _score_to_color(score: float, min_score: float, max_score: float) -> tuple[int, int, int]:
     if not math.isfinite(score):
-        return [0.55, 0.55, 0.55]
+        return (150, 150, 150)
     if math.isclose(min_score, max_score):
-        return [0.20, 0.85, 0.20]
+        return (32, 210, 64)
     ratio = float(np.clip((score - min_score) / (max_score - min_score), 0.0, 1.0))
     if ratio < 0.5:
         blend = ratio / 0.5
-        return [1.0, 0.25 + 0.65 * blend, 0.10]
+        return (255, int(64 + 176 * blend), 18)
     blend = (ratio - 0.5) / 0.5
-    return [0.95 - 0.75 * blend, 0.90, 0.10 + 0.15 * blend]
+    return (int(242 - 180 * blend), 230, int(24 + 64 * blend))
 
 
-def _pose_to_xyz(pose: np.ndarray, grid: object, z_lift: float) -> np.ndarray:
-    row, col = world_to_grid(float(pose[0]), float(pose[1]), grid)
-    z = grid_cell_height(row, col, grid) if is_traversable_cell(row, col, grid) else 0.0
-    return np.asarray([pose[0], pose[1], z + z_lift], dtype=np.float64)
+def _world_to_canvas(point_xy: np.ndarray, grid: object, cell_pixels: int) -> tuple[float, float]:
+    col_float = float(point_xy[0] / grid.voxel_size - grid.min_ix)
+    row_float = float(point_xy[1] / grid.voxel_size - grid.min_iy)
+    x = col_float * cell_pixels
+    y = (grid.state.shape[0] - row_float) * cell_pixels
+    return (x, y)
 
 
-def build_trajectory_lines(
-    grid: object,
+def _make_base_image(grid: object, cell_pixels: int) -> Image.Image:
+    image = Image.fromarray(grid.map_rgb_top_down, mode="RGB")
+    width = grid.state.shape[1] * cell_pixels
+    height = grid.state.shape[0] * cell_pixels
+    image = image.resize((width, height), Image.Resampling.NEAREST)
+    draw = ImageDraw.Draw(image)
+
+    grid_color = (210, 210, 210)
+    for col in range(grid.state.shape[1] + 1):
+        x = col * cell_pixels
+        draw.line([(x, 0), (x, height)], fill=grid_color, width=1)
+    for row in range(grid.state.shape[0] + 1):
+        y = row * cell_pixels
+        draw.line([(0, y), (width, y)], fill=grid_color, width=1)
+    return image
+
+
+def _render_overlay(
+    base_image: Image.Image,
     result: DWAResult,
-    z_lift: float | None = None,
-) -> o3d.geometry.LineSet:
-    z_lift = z_lift if z_lift is not None else float(grid.voxel_size) * 0.20
+    goal_xy: tuple[float, float] | np.ndarray,
+    state: RobotState,
+    project_xy: Callable[[np.ndarray], tuple[float, float]],
+    scale_px: int,
+    draw_invalid: bool = False,
+) -> Image.Image:
+    image = base_image.copy()
+    draw = ImageDraw.Draw(image)
     min_score, max_score = _trajectory_score_bounds(result)
     best_signature = (
         round(result.best_linear_velocity, 6),
         round(result.best_angular_velocity, 6),
     )
 
-    points: list[list[float]] = []
-    lines: list[list[int]] = []
-    colors: list[list[float]] = []
-
     for candidate in result.candidates:
-        if candidate.trajectory.shape[0] < 2:
+        if not candidate.valid and not draw_invalid:
             continue
+        color = _score_to_color(candidate.score, min_score, max_score)
+        if candidate.valid:
+            signature = (
+                round(candidate.linear_velocity, 6),
+                round(candidate.angular_velocity, 6),
+            )
+            if signature == best_signature:
+                color = (0, 255, 255)
 
-        signature = (
-            round(candidate.linear_velocity, 6),
-            round(candidate.angular_velocity, 6),
-        )
-        color = [0.0, 1.0, 1.0] if candidate.valid and signature == best_signature else _score_to_color(
-            candidate.score,
-            min_score,
-            max_score,
-        )
-        for start_pose, end_pose in zip(candidate.trajectory[:-1], candidate.trajectory[1:]):
-            start_point = _pose_to_xyz(start_pose, grid, z_lift)
-            end_point = _pose_to_xyz(end_pose, grid, z_lift)
-            point_index = len(points)
-            points.append(start_point.tolist())
-            points.append(end_point.tolist())
-            lines.append([point_index, point_index + 1])
-            colors.append(color)
+        polyline = [project_xy(pose[:2]) for pose in candidate.trajectory]
+        draw.line(polyline, fill=color, width=max(2, scale_px // 4))
 
-    line_set = o3d.geometry.LineSet()
-    if points:
-        line_set.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
-        line_set.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
-        line_set.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
-    return line_set
+    start_xy = np.asarray([state.x, state.y], dtype=np.float64)
+    goal_xy = np.asarray(goal_xy, dtype=np.float64)
+    start_canvas = project_xy(start_xy)
+    goal_canvas = project_xy(goal_xy)
+    marker_radius = max(3, scale_px // 3)
 
-
-def _rotation_from_z_axis(target: np.ndarray) -> np.ndarray:
-    source = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-    target = target / np.linalg.norm(target)
-    cross = np.cross(source, target)
-    dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
-    cross_norm = float(np.linalg.norm(cross))
-    if cross_norm < 1e-9:
-        if dot > 0.0:
-            return np.eye(3)
-        return o3d.geometry.get_rotation_matrix_from_axis_angle(np.asarray([1.0, 0.0, 0.0]) * math.pi)
-
-    skew = np.asarray(
+    draw.ellipse(
         [
-            [0.0, -cross[2], cross[1]],
-            [cross[2], 0.0, -cross[0]],
-            [-cross[1], cross[0], 0.0],
+            (start_canvas[0] - marker_radius, start_canvas[1] - marker_radius),
+            (start_canvas[0] + marker_radius, start_canvas[1] + marker_radius),
         ],
+        fill=(24, 144, 255),
+        outline=(255, 255, 255),
+        width=2,
+    )
+    draw.ellipse(
+        [
+            (goal_canvas[0] - marker_radius, goal_canvas[1] - marker_radius),
+            (goal_canvas[0] + marker_radius, goal_canvas[1] + marker_radius),
+        ],
+        fill=(255, 32, 192),
+        outline=(255, 255, 255),
+        width=2,
+    )
+
+    arrow_length_m = max(0.25, abs(result.best_linear_velocity) * 1.2)
+    arrow_heading = float(state.theta + result.best_angular_velocity * 0.5)
+    arrow_tip_xy = start_xy + arrow_length_m * np.asarray(
+        [math.cos(arrow_heading), math.sin(arrow_heading)],
         dtype=np.float64,
     )
-    return np.eye(3) + skew + (skew @ skew) * ((1.0 - dot) / (cross_norm**2))
+    tip_canvas = project_xy(arrow_tip_xy)
+    draw.line([start_canvas, tip_canvas], fill=(255, 145, 0), width=max(2, scale_px // 4))
 
-
-def build_velocity_arrow(
-    grid: object,
-    state: RobotState,
-    result: DWAResult,
-) -> o3d.geometry.TriangleMesh:
-    base_length = max(float(grid.voxel_size) * 1.2, abs(result.best_linear_velocity) * 1.2)
-    arrow = o3d.geometry.TriangleMesh.create_arrow(
-        cylinder_radius=float(grid.voxel_size) * 0.06,
-        cone_radius=float(grid.voxel_size) * 0.10,
-        cylinder_height=base_length * 0.65,
-        cone_height=base_length * 0.35,
+    arrow_head_length = max(6, scale_px)
+    left = (
+        tip_canvas[0] - arrow_head_length * math.cos(arrow_heading - math.pi / 6.0),
+        tip_canvas[1] + arrow_head_length * math.sin(arrow_heading - math.pi / 6.0),
     )
-    target_heading = float(state.theta + result.best_angular_velocity * 0.5)
-    direction = np.asarray(
-        [math.cos(target_heading), math.sin(target_heading), 0.0],
-        dtype=np.float64,
+    right = (
+        tip_canvas[0] - arrow_head_length * math.cos(arrow_heading + math.pi / 6.0),
+        tip_canvas[1] + arrow_head_length * math.sin(arrow_heading + math.pi / 6.0),
     )
-    arrow.rotate(_rotation_from_z_axis(direction), center=np.zeros(3, dtype=np.float64))
+    draw.polygon([tip_canvas, left, right], fill=(255, 145, 0))
 
-    row, col = world_to_grid(state.x, state.y, grid)
-    z = grid_cell_height(row, col, grid) if is_traversable_cell(row, col, grid) else 0.0
-    arrow.translate(np.asarray([state.x, state.y, z + float(grid.voxel_size) * 0.22], dtype=np.float64))
-    arrow.paint_uniform_color([1.0, 0.55, 0.10])
-    arrow.compute_vertex_normals()
-    return arrow
-
-
-def build_goal_marker(
-    goal_xy: tuple[float, float] | np.ndarray,
-    grid: object,
-) -> o3d.geometry.TriangleMesh:
-    goal = np.asarray(goal_xy, dtype=np.float64)
-    row, col = world_to_grid(float(goal[0]), float(goal[1]), grid)
-    z = grid_cell_height(row, col, grid) if is_traversable_cell(row, col, grid) else 0.0
-    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=float(grid.voxel_size) * 0.22)
-    sphere.translate(np.asarray([goal[0], goal[1], z + float(grid.voxel_size) * 0.35], dtype=np.float64))
-    sphere.paint_uniform_color([0.95, 0.15, 0.85])
-    sphere.compute_vertex_normals()
-    return sphere
-
-
-def build_robot_marker(state: RobotState, grid: object) -> o3d.geometry.TriangleMesh:
-    row, col = world_to_grid(state.x, state.y, grid)
-    z = grid_cell_height(row, col, grid) if is_traversable_cell(row, col, grid) else 0.0
-    mesh = o3d.geometry.TriangleMesh.create_sphere(radius=float(grid.voxel_size) * 0.18)
-    mesh.translate(np.asarray([state.x, state.y, z + float(grid.voxel_size) * 0.18], dtype=np.float64))
-    mesh.paint_uniform_color([0.15, 0.90, 0.95])
-    mesh.compute_vertex_normals()
-    return mesh
-
-
-def build_visualization_geometries(
-    grid: object,
-    result: DWAResult,
-    goal_xy: tuple[float, float] | np.ndarray,
-    state: RobotState,
-    show_blocked_directions: bool = False,
-    context_points: np.ndarray | None = None,
-    max_render_points: int = 20000,
-) -> list[o3d.geometry.Geometry]:
-    geometries: list[o3d.geometry.Geometry] = [
-        build_grid_mesh(grid),
-        build_direction_lines(grid=grid, show_blocked=show_blocked_directions),
-        build_trajectory_lines(grid=grid, result=result),
-        build_goal_marker(goal_xy=goal_xy, grid=grid),
-        build_velocity_arrow(grid=grid, state=state, result=result),
-        build_robot_marker(state=state, grid=grid),
-        o3d.geometry.TriangleMesh.create_coordinate_frame(
-            size=max(float(grid.voxel_size) * 4.0, 0.5),
-            origin=[0.0, 0.0, 0.0],
-        ),
+    text_lines = [
+        f"v={result.best_linear_velocity:.3f} m/s",
+        f"w={result.best_angular_velocity:.3f} rad/s",
+        f"score={result.best_score:.3f}" if math.isfinite(result.best_score) else "score=-inf",
+        f"valid={result.valid_candidate_count}/{len(result.candidates)}",
     ]
-    if context_points is not None and context_points.size > 0:
-        geometries.append(build_render_point_cloud(context_points, max_render_points))
-    return geometries
+    text_box_height = 8 + 16 * len(text_lines)
+    draw.rectangle([(6, 6), (170, text_box_height)], fill=(0, 0, 0))
+    for index, line in enumerate(text_lines):
+        draw.text((12, 10 + index * 16), line, fill=(255, 255, 255))
+
+    return image
+
+
+def render_dwa_result_image(
+    grid: object,
+    result: DWAResult,
+    goal_xy: tuple[float, float] | np.ndarray,
+    state: RobotState,
+    cell_pixels: int = 12,
+    draw_invalid: bool = False,
+) -> Image.Image:
+    if cell_pixels <= 1:
+        raise ValueError("cell_pixels must be greater than 1.")
+
+    return _render_overlay(
+        base_image=_make_base_image(grid, cell_pixels),
+        result=result,
+        goal_xy=goal_xy,
+        state=state,
+        project_xy=lambda point_xy: _world_to_canvas(point_xy, grid, cell_pixels),
+        scale_px=cell_pixels,
+        draw_invalid=draw_invalid,
+    )
+
+
+def render_dwa_on_base_image(
+    base_image_rgb: np.ndarray,
+    result: DWAResult,
+    goal_xy: tuple[float, float] | np.ndarray,
+    state: RobotState,
+    project_xy: Callable[[np.ndarray], tuple[float, float]],
+    scale_px: int = 12,
+    draw_invalid: bool = False,
+) -> Image.Image:
+    return _render_overlay(
+        base_image=Image.fromarray(base_image_rgb, mode="RGB"),
+        result=result,
+        goal_xy=goal_xy,
+        state=state,
+        project_xy=project_xy,
+        scale_px=scale_px,
+        draw_invalid=draw_invalid,
+    )
 
 
 def visualize_dwa_result(
@@ -192,19 +195,20 @@ def visualize_dwa_result(
     result: DWAResult,
     goal_xy: tuple[float, float] | np.ndarray,
     state: RobotState,
-    show_blocked_directions: bool = False,
-    context_points: np.ndarray | None = None,
-    max_render_points: int = 20000,
-    window_name: str = "DWA Planner",
-) -> list[o3d.geometry.Geometry]:
-    geometries = build_visualization_geometries(
+    output_path: str | Path | None = None,
+    cell_pixels: int = 12,
+    draw_invalid: bool = False,
+) -> Image.Image:
+    image = render_dwa_result_image(
         grid=grid,
         result=result,
         goal_xy=goal_xy,
         state=state,
-        show_blocked_directions=show_blocked_directions,
-        context_points=context_points,
-        max_render_points=max_render_points,
+        cell_pixels=cell_pixels,
+        draw_invalid=draw_invalid,
     )
-    o3d.visualization.draw_geometries(geometries, window_name=window_name)
-    return geometries
+    if output_path is not None:
+        path = Path(output_path).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(path)
+    return image
