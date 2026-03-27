@@ -2,24 +2,83 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import dataclass
 
 import numpy as np
 
 from dwaplanner.dwa_planner import DWAPlanner, RobotState, world_to_grid
 from dwaplanner.dwa_visualizer import render_dwa_result_image
-from dwaplanner.image_grid import build_grid_from_image_array
+
+
+@dataclass(slots=True)
+class FakeGrid:
+    voxel_size: float
+    min_ix: int
+    min_iy: int
+    height_index: np.ndarray
+    state: np.ndarray
+    passable_mask: np.ndarray
+    map_rgb_top_down: np.ndarray
+
+
+def _make_grid(rows: int, cols: int, meters_per_pixel: float, obstacle_mask_top_down: np.ndarray | None = None) -> FakeGrid:
+    min_ix = -(cols // 2)
+    min_iy = 0
+    state = np.ones((rows, cols), dtype=np.uint8)
+    if obstacle_mask_top_down is not None:
+        state = np.flipud(~obstacle_mask_top_down).astype(np.uint8)
+
+    passable_mask = np.zeros((rows, cols, 8), dtype=bool)
+    offsets = (
+        (0, 1),
+        (1, 1),
+        (1, 0),
+        (1, -1),
+        (0, -1),
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+    )
+    for row in range(rows):
+        for col in range(cols):
+            if state[row, col] == 0:
+                continue
+            for direction_index, (dx, dy) in enumerate(offsets):
+                neighbor_row = row + dy
+                neighbor_col = col + dx
+                if 0 <= neighbor_row < rows and 0 <= neighbor_col < cols and state[neighbor_row, neighbor_col] != 0:
+                    passable_mask[row, col, direction_index] = True
+
+    map_rgb_top_down = np.zeros((rows, cols, 3), dtype=np.uint8)
+    map_rgb_top_down[:] = np.asarray([244, 244, 244], dtype=np.uint8)
+    if obstacle_mask_top_down is not None:
+        map_rgb_top_down[obstacle_mask_top_down] = np.asarray([28, 28, 28], dtype=np.uint8)
+
+    return FakeGrid(
+        voxel_size=meters_per_pixel,
+        min_ix=min_ix,
+        min_iy=min_iy,
+        height_index=np.zeros((rows, cols), dtype=np.int32),
+        state=state,
+        passable_mask=passable_mask,
+        map_rgb_top_down=map_rgb_top_down,
+    )
 
 
 def make_flat_grid(rows: int = 12, cols: int = 13, meters_per_pixel: float = 0.25):
-    image = np.full((rows, cols), 255, dtype=np.uint8)
-    return build_grid_from_image_array(image, meters_per_pixel=meters_per_pixel)
+    return _make_grid(rows=rows, cols=cols, meters_per_pixel=meters_per_pixel)
 
 
 def make_blocked_forward_grid(rows: int = 18, cols: int = 17, meters_per_pixel: float = 0.2):
-    image = np.full((rows, cols), 255, dtype=np.uint8)
+    obstacle_mask_top_down = np.zeros((rows, cols), dtype=bool)
     center = cols // 2
-    image[rows - 4 : rows - 1, center - 1 : center + 2] = 0
-    return build_grid_from_image_array(image, meters_per_pixel=meters_per_pixel)
+    obstacle_mask_top_down[rows - 4 : rows - 1, center - 1 : center + 2] = True
+    return _make_grid(
+        rows=rows,
+        cols=cols,
+        meters_per_pixel=meters_per_pixel,
+        obstacle_mask_top_down=obstacle_mask_top_down,
+    )
 
 
 class DWAPlannerTest(unittest.TestCase):
