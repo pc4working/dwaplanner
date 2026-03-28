@@ -31,14 +31,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-x", type=float, default=0.0, help="Goal x position in meters.")
     parser.add_argument("--goal-y", type=float, default=2.0, help="Goal y position in meters.")
     parser.add_argument("--start-x", type=float, default=0.0, help="Robot start x position.")
-    parser.add_argument("--start-y", type=float, default=None, help="Robot start y position. Defaults to half a cell.")
+    parser.add_argument(
+        "--start-y",
+        type=float,
+        default=None,
+        help="Robot start y position. Defaults to robot_radius + half a cell so the body starts inside known free space.",
+    )
     parser.add_argument(
         "--start-theta-deg",
         type=float,
         default=90.0,
         help="Robot heading in degrees. 90 degrees points along +y.",
     )
-    parser.add_argument("--current-v", type=float, default=0.0, help="Current linear velocity in m/s.")
+    parser.add_argument("--current-v", type=float, default=0.5, help="Current linear velocity in m/s.")
     parser.add_argument("--current-w", type=float, default=0.0, help="Current angular velocity in rad/s.")
     parser.add_argument("--voxel-size", type=float, default=0.15, help="Voxel size in meters.")
     parser.add_argument(
@@ -87,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overlay-scale-px", type=int, default=10, help="Reference pixel size for DWA overlay thickness.")
     parser.add_argument("--draw-invalid", action="store_true", help="Also draw invalid candidate trajectories.")
+    parser.add_argument("--min-linear-velocity", type=float, default=0.5, help="Minimum commanded cruise speed.")
     parser.add_argument("--max-linear-velocity", type=float, default=1.0, help="Max linear velocity.")
     parser.add_argument("--max-angular-velocity", type=float, default=1.0, help="Max angular velocity.")
     parser.add_argument("--max-linear-acceleration", type=float, default=0.5, help="Max linear acceleration.")
@@ -100,17 +106,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-progress-weight", type=float, default=0.8, help="Weight for distance reduction toward the goal.")
     parser.add_argument("--clearance-weight", type=float, default=0.5, help="Weight for clearance.")
     parser.add_argument("--velocity-weight", type=float, default=0.2, help="Weight for speed preference.")
+    parser.add_argument("--robot-radius", type=float, default=0.25, help="Robot body radius in meters.")
     parser.add_argument(
         "--clearance-search-radius-cells",
         type=int,
         default=4,
-        help="Search radius for nearest empty cell clearance.",
+        help="Clearance score normalization cap in cell units after distance-transform lookup.",
     )
     return parser.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> DWAConfig:
     return DWAConfig(
+        min_linear_velocity=args.min_linear_velocity,
         max_linear_velocity=args.max_linear_velocity,
         max_angular_velocity=args.max_angular_velocity,
         max_linear_acceleration=args.max_linear_acceleration,
@@ -125,6 +133,7 @@ def build_config(args: argparse.Namespace) -> DWAConfig:
         clearance_weight=args.clearance_weight,
         velocity_weight=args.velocity_weight,
         clearance_search_radius_cells=args.clearance_search_radius_cells,
+        robot_radius=args.robot_radius,
     )
 
 
@@ -156,7 +165,7 @@ def main() -> None:
 
     state = RobotState(
         x=args.start_x,
-        y=args.start_y if args.start_y is not None else run.grid.voxel_size * 0.5,
+        y=args.start_y if args.start_y is not None else args.robot_radius + run.grid.voxel_size * 0.5,
         theta=math.radians(args.start_theta_deg),
         linear_velocity=args.current_v,
         angular_velocity=args.current_w,

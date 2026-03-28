@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dwaplanner.dwa_planner import DWAPlanner, RobotState, world_to_grid
+from dwaplanner.dwa_planner import DWAConfig, DWAPlanner, RobotState, world_to_grid
 from dwaplanner.dwa_visualizer import render_dwa_result_image
 
 
@@ -72,13 +72,17 @@ def make_flat_grid(rows: int = 12, cols: int = 13, meters_per_pixel: float = 0.2
 def make_blocked_forward_grid(rows: int = 18, cols: int = 17, meters_per_pixel: float = 0.2):
     obstacle_mask_top_down = np.zeros((rows, cols), dtype=bool)
     center = cols // 2
-    obstacle_mask_top_down[rows - 4 : rows - 1, center - 1 : center + 2] = True
+    obstacle_mask_top_down[1:4, center - 1 : center + 2] = True
     return _make_grid(
         rows=rows,
         cols=cols,
         meters_per_pixel=meters_per_pixel,
         obstacle_mask_top_down=obstacle_mask_top_down,
     )
+
+
+def make_safe_start_state(grid: FakeGrid) -> RobotState:
+    return RobotState(y=grid.voxel_size * 1.5)
 
 
 class DWAPlannerTest(unittest.TestCase):
@@ -90,17 +94,17 @@ class DWAPlannerTest(unittest.TestCase):
     def test_forward_goal_prefers_forward_motion(self) -> None:
         grid = make_flat_grid()
         planner = DWAPlanner()
-        result = planner.plan(grid, goal_xy=(0.0, 1.5), state=RobotState())
+        result = planner.plan(grid, goal_xy=(0.0, 1.5), state=make_safe_start_state(grid))
 
         self.assertFalse(result.used_emergency_stop)
         self.assertGreater(result.valid_candidate_count, 0)
-        self.assertGreater(result.best_linear_velocity, 0.05)
+        self.assertGreaterEqual(result.best_linear_velocity, 0.5)
         self.assertLess(abs(result.best_angular_velocity), 0.11)
 
     def test_goal_inside_tolerance_returns_stop(self) -> None:
         grid = make_flat_grid()
         planner = DWAPlanner()
-        result = planner.plan(grid, goal_xy=(0.0, 0.1), state=RobotState())
+        result = planner.plan(grid, goal_xy=(0.0, 0.45), state=make_safe_start_state(grid))
 
         self.assertEqual(result.best_linear_velocity, 0.0)
         self.assertEqual(result.best_angular_velocity, 0.0)
@@ -110,18 +114,44 @@ class DWAPlannerTest(unittest.TestCase):
         grid = make_blocked_forward_grid()
 
         planner = DWAPlanner()
-        result = planner.plan(grid, goal_xy=(0.2, 1.5), state=RobotState())
+        result = planner.plan(grid, goal_xy=(0.2, 1.5), state=make_safe_start_state(grid))
 
         self.assertFalse(result.used_emergency_stop)
         self.assertGreater(abs(result.best_angular_velocity), 0.09)
-        self.assertLess(result.best_linear_velocity, 0.2)
+        self.assertGreaterEqual(result.best_linear_velocity, 0.5)
         self.assertTrue(math.isfinite(result.best_score))
+
+    def test_occupied_but_not_passable_start_cell_is_rejected(self) -> None:
+        grid = make_flat_grid()
+        start_row, start_col = world_to_grid(0.0, 0.0, grid)
+        grid.passable_mask[start_row, start_col, :] = False
+
+        planner = DWAPlanner(DWAConfig(robot_radius=0.0))
+        with self.assertRaises(RuntimeError):
+            planner.plan(grid, goal_xy=(0.0, 1.5), state=RobotState())
+
+    def test_robot_radius_rejects_too_narrow_corridor(self) -> None:
+        rows = 12
+        cols = 11
+        obstacle_mask_top_down = np.ones((rows, cols), dtype=bool)
+        obstacle_mask_top_down[:, cols // 2] = False
+        grid = _make_grid(
+            rows=rows,
+            cols=cols,
+            meters_per_pixel=0.2,
+            obstacle_mask_top_down=obstacle_mask_top_down,
+        )
+
+        planner = DWAPlanner(DWAConfig(robot_radius=0.25))
+        with self.assertRaises(RuntimeError):
+            planner.plan(grid, goal_xy=(0.0, 1.5), state=RobotState())
 
     def test_render_output_has_expected_size(self) -> None:
         grid = make_flat_grid()
         planner = DWAPlanner()
-        result = planner.plan(grid, goal_xy=(0.0, 1.5), state=RobotState())
-        image = render_dwa_result_image(grid, result, goal_xy=(0.0, 1.5), state=RobotState(), cell_pixels=10)
+        state = make_safe_start_state(grid)
+        result = planner.plan(grid, goal_xy=(0.0, 1.5), state=state)
+        image = render_dwa_result_image(grid, result, goal_xy=(0.0, 1.5), state=state, cell_pixels=10)
 
         self.assertEqual(image.size, (grid.state.shape[1] * 10, grid.state.shape[0] * 10))
 

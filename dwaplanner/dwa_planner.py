@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 EMPTY_STATE_VALUE = 0
 _DIRECTION_TO_INDEX = {
@@ -31,6 +32,13 @@ class TraversabilityGridLike(Protocol):
 
 
 @dataclass(slots=True)
+class PlanningContext:
+    passable_cell_mask: np.ndarray
+    safe_passable_cell_mask: np.ndarray
+    clearance_map: np.ndarray
+
+
+@dataclass(slots=True)
 class RobotState:
     x: float = 0.0
     y: float = 0.0
@@ -41,7 +49,7 @@ class RobotState:
 
 @dataclass(slots=True)
 class DWAConfig:
-    min_linear_velocity: float = 0.0
+    min_linear_velocity: float = 0.5
     max_linear_velocity: float = 1.0
     max_angular_velocity: float = 1.0
     max_linear_acceleration: float = 0.5
@@ -57,8 +65,11 @@ class DWAConfig:
     velocity_weight: float = 0.2
     clearance_search_radius_cells: int = 4
     goal_tolerance: float = 0.25
+    robot_radius: float = 0.25
 
     def __post_init__(self) -> None:
+        if self.min_linear_velocity < 0.0:
+            raise ValueError("min_linear_velocity cannot be negative.")
         if self.max_linear_velocity <= self.min_linear_velocity:
             raise ValueError("max_linear_velocity must be greater than min_linear_velocity.")
         if self.max_angular_velocity <= 0.0:
@@ -81,6 +92,8 @@ class DWAConfig:
             raise ValueError("clearance_search_radius_cells must be positive.")
         if self.goal_tolerance < 0.0:
             raise ValueError("goal_tolerance cannot be negative.")
+        if self.robot_radius < 0.0:
+            raise ValueError("robot_radius cannot be negative.")
 
 
 @dataclass(slots=True)
@@ -129,7 +142,13 @@ def is_traversable_cell(row: int, col: int, grid: TraversabilityGridLike) -> boo
     rows, cols = grid.state.shape
     if row < 0 or row >= rows or col < 0 or col >= cols:
         return False
-    return bool(grid.state[row, col] != EMPTY_STATE_VALUE)
+    return bool(build_passable_cell_mask(grid)[row, col])
+
+
+def build_passable_cell_mask(grid: TraversabilityGridLike) -> np.ndarray:
+    occupied_mask = np.asarray(grid.state != EMPTY_STATE_VALUE, dtype=bool)
+    directional_mask = np.asarray(grid.passable_mask.any(axis=2), dtype=bool)
+    return occupied_mask & directional_mask
 
 
 def grid_cell_height(row: int, col: int, grid: TraversabilityGridLike) -> float:
@@ -153,7 +172,8 @@ class DWAPlanner:
         if goal.shape != (2,):
             raise ValueError("goal_xy must be a 2D position.")
 
-        self._ensure_pose_on_grid(state.x, state.y, grid)
+        planning_context = self._build_planning_context(grid)
+        self._ensure_pose_on_grid(state.x, state.y, grid, planning_context)
         current_position = np.asarray([state.x, state.y], dtype=np.float64)
         initial_goal_distance = float(np.linalg.norm(goal - current_position))
         if float(np.linalg.norm(goal - current_position)) <= self.config.goal_tolerance:
@@ -176,7 +196,7 @@ class DWAPlanner:
                         velocity_score=0.0,
                         min_clearance=self._compute_cell_clearance(
                             *world_to_grid(state.x, state.y, grid),
-                            grid,
+                            planning_context,
                         ),
                         final_goal_distance=float(np.linalg.norm(goal - current_position)),
                         valid=True,
@@ -190,7 +210,7 @@ class DWAPlanner:
 
         for linear_velocity, angular_velocity in self._sample_velocities(dynamic_window):
             trajectory = self._simulate_trajectory(state, linear_velocity, angular_velocity)
-            valid, min_clearance = self._check_collision(trajectory, grid)
+            valid, min_clearance = self._check_collision(trajectory, grid, planning_context)
             final_goal_distance = float(np.linalg.norm(goal - trajectory[-1, :2]))
             if valid:
                 heading_score = self._compute_heading_score(trajectory, goal)
@@ -255,8 +275,11 @@ class DWAPlanner:
     def _compute_dynamic_window(self, state: RobotState) -> tuple[float, float, float, float]:
         dv = self.config.max_linear_acceleration * self.config.control_interval
         dw = self.config.max_angular_acceleration * self.config.control_interval
-        min_v = max(self.config.min_linear_velocity, state.linear_velocity - dv)
+        min_v = max(0.0, state.linear_velocity - dv)
         max_v = min(self.config.max_linear_velocity, state.linear_velocity + dv)
+        if max_v > 0.0:
+            min_v = max(self.config.min_linear_velocity, min_v)
+            max_v = max(min_v, max_v)
         min_w = max(-self.config.max_angular_velocity, state.angular_velocity - dw)
         max_w = min(self.config.max_angular_velocity, state.angular_velocity + dw)
         if min_v > max_v:
@@ -313,13 +336,14 @@ class DWAPlanner:
         self,
         trajectory: np.ndarray,
         grid: TraversabilityGridLike,
+        planning_context: PlanningContext,
     ) -> tuple[bool, float]:
         prev_point = trajectory[0, :2]
         prev_row, prev_col = world_to_grid(float(prev_point[0]), float(prev_point[1]), grid)
-        if not is_traversable_cell(prev_row, prev_col, grid):
+        if not self._is_safe_passable_cell(prev_row, prev_col, planning_context):
             return False, 0.0
 
-        min_clearance = self._compute_cell_clearance(prev_row, prev_col, grid)
+        min_clearance = self._compute_cell_clearance(prev_row, prev_col, planning_context)
         for point in trajectory[1:, :2]:
             valid, segment_min_clearance, prev_row, prev_col = self._check_segment(
                 prev_point,
@@ -327,6 +351,7 @@ class DWAPlanner:
                 prev_row,
                 prev_col,
                 grid,
+                planning_context,
             )
             min_clearance = min(min_clearance, segment_min_clearance)
             if not valid:
@@ -342,22 +367,23 @@ class DWAPlanner:
         start_row: int,
         start_col: int,
         grid: TraversabilityGridLike,
+        planning_context: PlanningContext,
     ) -> tuple[bool, float, int, int]:
         segment = end_xy - start_xy
         distance = float(np.linalg.norm(segment))
         if distance == 0.0:
-            clearance = self._compute_cell_clearance(start_row, start_col, grid)
+            clearance = self._compute_cell_clearance(start_row, start_col, planning_context)
             return True, clearance, start_row, start_col
 
         steps = max(1, int(math.ceil(distance / max(grid.voxel_size * 0.5, 1e-6))))
         prev_row = start_row
         prev_col = start_col
-        min_clearance = self._compute_cell_clearance(start_row, start_col, grid)
+        min_clearance = self._compute_cell_clearance(start_row, start_col, planning_context)
         for index in range(1, steps + 1):
             alpha = index / steps
             sample_xy = start_xy + alpha * segment
             row, col = world_to_grid(float(sample_xy[0]), float(sample_xy[1]), grid)
-            if not is_traversable_cell(row, col, grid):
+            if not self._is_safe_passable_cell(row, col, planning_context):
                 return False, 0.0, row, col
 
             if row != prev_row or col != prev_col:
@@ -369,7 +395,7 @@ class DWAPlanner:
                 if not bool(grid.passable_mask[prev_row, prev_col, direction_index]):
                     return False, 0.0, row, col
 
-            min_clearance = min(min_clearance, self._compute_cell_clearance(row, col, grid))
+            min_clearance = min(min_clearance, self._compute_cell_clearance(row, col, planning_context))
             prev_row = row
             prev_col = col
 
@@ -417,39 +443,50 @@ class DWAPlanner:
         self,
         row: int,
         col: int,
-        grid: TraversabilityGridLike,
+        planning_context: PlanningContext,
     ) -> float:
-        rows, cols = grid.state.shape
-        search_radius = self.config.clearance_search_radius_cells
-        row_min = max(0, row - search_radius)
-        row_max = min(rows, row + search_radius + 1)
-        col_min = max(0, col - search_radius)
-        col_max = min(cols, col + search_radius + 1)
+        rows, cols = planning_context.clearance_map.shape
+        if row < 0 or row >= rows or col < 0 or col >= cols:
+            return 0.0
+        return float(planning_context.clearance_map[row, col])
 
-        neighborhood = grid.state[row_min:row_max, col_min:col_max]
-        empty_cells = np.argwhere(neighborhood == EMPTY_STATE_VALUE)
-
-        min_clearance = float(search_radius * grid.voxel_size)
-        if empty_cells.size > 0:
-            empty_cells = empty_cells.astype(np.int32)
-            empty_cells[:, 0] += row_min
-            empty_cells[:, 1] += col_min
-            delta_rows = empty_cells[:, 0] - row
-            delta_cols = empty_cells[:, 1] - col
-            distances = np.hypot(delta_rows, delta_cols) * grid.voxel_size
-            min_clearance = min(min_clearance, float(distances.min()))
-
-        edge_clearance = min(
-            (row + 0.5) * grid.voxel_size,
-            (rows - row - 0.5) * grid.voxel_size,
-            (col + 0.5) * grid.voxel_size,
-            (cols - col - 0.5) * grid.voxel_size,
+    def _build_planning_context(self, grid: TraversabilityGridLike) -> PlanningContext:
+        passable_cell_mask = build_passable_cell_mask(grid)
+        padded_mask = np.pad(passable_cell_mask, 1, mode="constant", constant_values=False)
+        clearance_map = distance_transform_edt(
+            padded_mask,
+            sampling=float(grid.voxel_size),
+        )[1:-1, 1:-1]
+        # Convert center-to-center EDT into a conservative boundary clearance estimate.
+        clearance_map = np.maximum(clearance_map - 0.5 * float(grid.voxel_size), 0.0)
+        clearance_map[~passable_cell_mask] = 0.0
+        safe_passable_cell_mask = passable_cell_mask & (clearance_map >= self.config.robot_radius)
+        return PlanningContext(
+            passable_cell_mask=passable_cell_mask,
+            safe_passable_cell_mask=safe_passable_cell_mask,
+            clearance_map=clearance_map,
         )
-        return max(0.0, min(min_clearance, float(edge_clearance)))
 
-    def _ensure_pose_on_grid(self, x: float, y: float, grid: TraversabilityGridLike) -> None:
+    def _is_safe_passable_cell(
+        self,
+        row: int,
+        col: int,
+        planning_context: PlanningContext,
+    ) -> bool:
+        rows, cols = planning_context.safe_passable_cell_mask.shape
+        if row < 0 or row >= rows or col < 0 or col >= cols:
+            return False
+        return bool(planning_context.safe_passable_cell_mask[row, col])
+
+    def _ensure_pose_on_grid(
+        self,
+        x: float,
+        y: float,
+        grid: TraversabilityGridLike,
+        planning_context: PlanningContext,
+    ) -> None:
         row, col = world_to_grid(x, y, grid)
-        if not is_traversable_cell(row, col, grid):
+        if not self._is_safe_passable_cell(row, col, planning_context):
             raise RuntimeError(
-                f"Robot pose ({x:.3f}, {y:.3f}) is outside the traversable grid."
+                f"Robot pose ({x:.3f}, {y:.3f}) is outside the safe PASSABLE region."
             )

@@ -35,16 +35,18 @@ The voxsense system provides a 2.5D traversability grid with 8-directional passa
 
 **Collision Checking:**
 - Query grid for each trajectory point
-- Validate cell occupancy (state != EMPTY)
+- Validate that the robot center stays on a derived `PASSABLE` floor mask
 - Check directional passability using passable_mask[row, col, direction]
+- Reject trajectories whose clearance is smaller than `robot_radius`
 
 **Cost Function:**
 ```
 score = α_heading × heading_alignment +
+        α_goal_progress × goal_progress +
         α_clearance × obstacle_distance +
         α_velocity × speed_preference
 ```
-Default weights: heading=1.0, clearance=0.5, velocity=0.2
+Default weights: heading=1.0, goal_progress=0.8, clearance=0.5, velocity=0.2
 
 ### 3. Code Structure
 
@@ -89,7 +91,7 @@ def world_to_grid(x, y, grid):
 Map motion vector (dx, dy) to nearest of 8 cardinal directions, then check `grid.passable_mask[row, col, direction_idx]`
 
 **Clearance computation:**
-Search nearby cells for EMPTY state, compute Euclidean distance
+Precompute a distance field with `scipy.ndimage.distance_transform_edt`, then read clearance in `O(1)` per sampled point
 
 ### 5. Visualization Design
 
