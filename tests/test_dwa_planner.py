@@ -8,6 +8,14 @@ import numpy as np
 
 from dwaplanner.dwa_planner import DWAConfig, DWAPlanner, RobotState, world_to_grid
 from dwaplanner.dwa_visualizer import render_dwa_result_image
+from dwaplanner.unitree_b2 import (
+    B2CommandLimits,
+    B2MotionState,
+    B2VelocityCommand,
+    DEFAULT_B2_MAX_ANGULAR_VELOCITY,
+    build_robot_state_from_motion_state,
+    clamp_b2_velocity_command,
+)
 
 
 @dataclass(slots=True)
@@ -86,6 +94,9 @@ def make_safe_start_state(grid: FakeGrid) -> RobotState:
 
 
 class DWAPlannerTest(unittest.TestCase):
+    def test_default_b2_angular_limit_is_used_by_dwa(self) -> None:
+        self.assertAlmostEqual(DWAConfig().max_angular_velocity, DEFAULT_B2_MAX_ANGULAR_VELOCITY)
+
     def test_world_to_grid_matches_expected_origin_cell(self) -> None:
         grid = make_flat_grid()
         row, col = world_to_grid(0.0, 0.0, grid)
@@ -154,6 +165,42 @@ class DWAPlannerTest(unittest.TestCase):
         image = render_dwa_result_image(grid, result, goal_xy=(0.0, 1.5), state=state, cell_pixels=10)
 
         self.assertEqual(image.size, (grid.state.shape[1] * 10, grid.state.shape[0] * 10))
+
+    def test_b2_command_clamp_limits_forward_and_yaw_speed(self) -> None:
+        command = B2VelocityCommand(linear_x=1.8, angular_z=0.9)
+        clipped = clamp_b2_velocity_command(
+            command,
+            limits=B2CommandLimits(max_forward_velocity=1.0, max_angular_velocity=0.35),
+        )
+
+        self.assertAlmostEqual(clipped.linear_x, 1.0)
+        self.assertAlmostEqual(clipped.angular_z, 0.35)
+
+    def test_build_robot_state_from_motion_state_keeps_fallback_pose_by_default(self) -> None:
+        fallback_state = RobotState(x=1.0, y=2.0, theta=0.5, linear_velocity=0.1, angular_velocity=0.2)
+        motion_state = B2MotionState(
+            timestamp_seconds=12.0,
+            mode=0,
+            gait_type=0,
+            progress=0.0,
+            position_x=9.0,
+            position_y=8.0,
+            position_z=0.0,
+            yaw=1.2,
+            linear_velocity_x=0.3,
+            linear_velocity_y=0.4,
+            linear_velocity_z=0.0,
+            yaw_speed=0.25,
+            body_height=0.0,
+        )
+
+        state = build_robot_state_from_motion_state(motion_state, fallback_state, use_live_pose=False)
+
+        self.assertEqual(state.x, fallback_state.x)
+        self.assertEqual(state.y, fallback_state.y)
+        self.assertEqual(state.theta, fallback_state.theta)
+        self.assertAlmostEqual(state.linear_velocity, 0.5)
+        self.assertAlmostEqual(state.angular_velocity, 0.25)
 
 
 if __name__ == "__main__":

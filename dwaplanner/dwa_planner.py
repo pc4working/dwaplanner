@@ -51,7 +51,7 @@ class RobotState:
 class DWAConfig:
     min_linear_velocity: float = 0.5
     max_linear_velocity: float = 1.0
-    max_angular_velocity: float = 1.0
+    max_angular_velocity: float = 0.35
     max_linear_acceleration: float = 0.5
     max_angular_acceleration: float = 1.0
     control_interval: float = 0.5

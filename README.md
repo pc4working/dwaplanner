@@ -4,6 +4,7 @@
 
 - `dwaplanner/dwa_planner.py`: DWA 核心采样、轨迹仿真、方向可通行检查和评分。
 - `dwaplanner/dwa_visualizer.py`: 把候选轨迹、最佳轨迹、起点、目标和速度箭头叠加到二维图片上。
+- `dwaplanner/unitree_b2.py`: Unitree B2 SDK2 适配层，负责状态读取、速度限幅和 `Move(vx, 0, vyaw)` 下发。
 - `dwaplanner/voxsense_adapter.py`: 导入相邻 `voxsense` 仓库里的建图和 BEV 渲染函数。
 - `test_dwa_planner.py`: 读取点云、运行规划并输出带叠加轨迹的 BEV PNG。
 - `tests/test_dwa_planner.py`: 基于二维栅格图的最小单元测试。
@@ -51,11 +52,40 @@ python3 test_dwa_planner.py /home/pc/code/voxsense/pcd/平地无障碍.pcd \
   --output-path outputs/flat_dwa_bev.png
 ```
 
+## B2 实机控制
+
+可以在同一入口里直接把 DWA 选出的速度下发到 B2。当前实现是“单次局部规划 + 执行一个控制周期”：
+
+- 地图仍然来自 `voxsense` 对当前点云快照的分析
+- 规划后只执行当前最优 `(v, w)`，这是 DWA 的标准用法
+- 如果需要真正闭环重规划，需要外部持续提供新的点云快照
+
+示例：
+
+```bash
+python3 test_dwa_planner.py /home/pc/code/voxsense/pcd/柱子.pcd \
+  --goal-y 2.5 \
+  --use-unitree-state \
+  --execute-unitree \
+  --unitree-network-interface enp2s0 \
+  --unitree-stand-up \
+  --unitree-balance-stand
+```
+
+常用实机参数：
+
+- `--use-unitree-state`：规划前从 B2 `sportmodestate` 读取当前速度，避免动态窗口和真实速度脱节。
+- `--use-unitree-pose`：同时使用 B2 的实时 `x/y/yaw` 作为规划位姿。只有在地图坐标系和机器人运动状态坐标系已经对齐时才应该开启。
+- `--execute-unitree`：把 DWA 输出直接发给 B2。
+- `--unitree-command-duration`：重复发送速度命令的时长，默认等于 `control_interval`。
+- `--unitree-command-rate-hz`：重复发送 `Move(vx, 0, vyaw)` 的频率。
+- `--unitree-classic-walk`：执行命令前临时切到 `ClassicWalk`，命令结束后会自动恢复。
+
 ## 算法说明
 
 机器人模型采用差速底盘 `(x, y, theta)` 与控制 `(v, w)`：
 
-- 动态窗口默认限制：`v ∈ [0.5, 1.0] m/s`，`|w| <= 1.0 rad/s`
+- 动态窗口默认限制：`v ∈ [0.5, 1.0] m/s`，`|w| <= 0.35 rad/s`
 - 预测时域：`2.0 s`
 - 仿真步长：`0.1 s`
 - 采样密度：`7 x 11`
@@ -77,6 +107,14 @@ score =
 - 机器人半径：使用 `scipy.ndimage.distance_transform_edt` 预计算 clearance 距离场；若任一轨迹采样点的 clearance 小于 `robot_radius`，该轨迹直接判为非法。
 
 `goal_progress` 表示一条候选轨迹在预测时域内让机器人离目标减少了多少距离。这个项的作用是避免机器人只是在原地保持朝向正确，却没有真正向目标推进。
+
+对 B2 的实际控制还额外加了一层 SDK 下发限幅：
+
+- 线速度会被裁剪到 `[-max_linear_velocity, max_linear_velocity]`
+- 侧向速度固定为 `0`
+- 角速度会被裁剪到 `[-0.35, 0.35] rad/s`
+
+这样规划器、可视化和 SDK 下发三个环节使用的是同一组运动上限。
 
 ## 测试
 

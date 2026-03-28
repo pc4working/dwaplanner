@@ -24,7 +24,7 @@ The voxsense system provides a 2.5D traversability grid with 8-directional passa
 **Robot Model:** Differential drive with state (x, y, θ) and control (v, w)
 
 **Dynamic Window:**
-- Max velocities: v_max=1.0 m/s, w_max=1.0 rad/s
+- Max velocities: v_max=1.0 m/s, w_max=0.35 rad/s
 - Acceleration limits: v_acc=0.5 m/s², w_acc=1.0 rad/s²
 - Sample 7 linear × 11 angular velocities = ~77 trajectories
 
@@ -120,6 +120,13 @@ Precompute a distance field with `scipy.ndimage.distance_transform_edt`, then re
 - Velocity command: (v, w) in m/s and rad/s
 - Best trajectory: list of (x, y, θ) poses
 - Visualization: 3D window showing grid + trajectories + goal
+
+### 7. Unitree B2 Execution
+
+- Reuse `unitree_sdk2_python` B2 high-level sport client
+- Read current `sportmodestate` before planning when available
+- Clip the final `Move(vx, 0, vyaw)` command to the B2-safe command envelope
+- Keep one planning cycle mapped to one executed control interval
 
 ---
 
